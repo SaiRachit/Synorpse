@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SYNORPSE</title>
+    <link rel="stylesheet" href="sphere.css">
+    <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+</head>
+
+<body>
+
+    <!-- ========== SPHERE ========== -->
+    <div id="sphere-container">
+        <div class="sphere-glow"></div>
+        <canvas id="sphere-canvas" width="128" height="128"></canvas>
+    </div>
+
+    <!-- ========== CHAT PANEL (below sphere) ========== -->
+    <div id="chat-panel">
+        <div class="chat-header">
+            <div class="chat-header-left">
+                <div class="chat-header-dot"></div>
+                <span class="chat-header-title">SYNORPSE</span>
+            </div>
+            <div class="chat-header-actions">
+                <button id="chat-upload-btn" class="chat-header-btn upload-btn"
+                    title="Upload document for analysis">📎</button>
+                <button id="chat-clear-btn" class="chat-header-btn clear-btn" title="Clear chat history">🗑</button>
+                <button id="chat-close-btn" class="chat-header-btn close-btn" title="Exit SYNORPSE">✕</button>
+            </div>
+        </div>
+
+        <div id="chat-messages" class="chat-messages">
+            <div class="welcome-message">
+                <span class="welcome-icon">✦</span>
+                <span class="welcome-name">Synorpse</span>
+                Ask me anything — I can search the web, open apps, generate images, create files, and much more.
+            </div>
+        </div>
+
+        <div class="chat-input-area">
+            <div class="chat-input-wrapper">
+                <input type="text" id="chat-input" class="chat-input" placeholder="Ask Synorpse anything..."
+                    autocomplete="off" spellcheck="false">
+                <button id="chat-send-btn" class="chat-send-btn">➜</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="sphere.js"></script>
+</body>
+
+</html>

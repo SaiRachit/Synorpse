@@ -1,0 +1,98 @@
+system:
+  assistant_name: "Synorpse"
+  username: "User"
+  mode: "supervised"  # autonomous, proactive, supervised, reactive
+
+# Database Configuration
+database:
+  name: "synorpse_chat"
+  user: "postgres"
+  password: ""  # Override with .env
+  host: "localhost"
+  port: 5432
+
+# API Keys (override with .env)
+api_keys:
+  groq_api_key: ""
+  groq_api_key_2: ""
+  groq_api_key_3: ""
+  google_api_key: ""
+  google_cse_id: ""
+
+# Agentic Core Settings
+agentic:
+  suggestion_interval_seconds: 600  # 10 minutes
+  autonomous_loop_interval: 30  # seconds
+  max_background_workers: 4
+  task_execution_timeout: 300  # 5 minutes
+  enable_proactive_suggestions: true
+
+# Image Generation Settings
+image_generation:
+  model: "stabilityai/sdxl-turbo"
+  device: "cuda"  # cuda or cpu
+  steps: 4
+  guidance_scale: 0.0
+  max_retries: 3
+  output_dir: "Generated_Images"
+
+# Search Settings
+search:
+  cache_expiry_hours: 24
+  max_search_results: 5
+  scrape_timeout_seconds: 10
+  realtime_search_candidates: 3
+
+# Automation Settings
+automation:
+  default_confidence_threshold: 75
+  max_files_to_search: 5
+  default_search_paths:
+    - "C:\\Users"
+    - "D:\\"
+  file_extensions:
+    documents: [".pdf", ".docx", ".doc", ".pptx", ".ppt", ".xlsx", ".xls", ".txt"]
+    images: [".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"]
+    videos: [".mp4", ".avi", ".mkv", ".mov"]
+
+# Logging Configuration
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  console_output: true
+  file_output: true
+  log_dir: "logs"
+  max_log_size_mb: 10
+  backup_count: 5
+  performance_logging: true
+  
+# Error Handling
+error_handling:
+  max_retries: 3
+  retry_delay_seconds: 2
+  exponential_backoff: true
+  circuit_breaker_threshold: 5
+  circuit_breaker_timeout: 60
+
+# Security
+security:
+  enable_input_validation: true
+  enable_rate_limiting: true
+  rate_limit_requests_per_minute: 60
+  enable_audit_logging: true
+  allowed_file_extensions: [".pdf", ".docx", ".doc", ".txt", ".png", ".jpg", ".jpeg"]
+
+# User Experience
+ui:
+  use_rich_formatting: true
+  show_progress_bars: true
+  enable_command_history: true
+  max_history_items: 100
+  enable_autocomplete: true
+  streaming_responses: true
+
+# Performance
+performance:
+  enable_caching: true
+  cache_size_mb: 100
+  enable_metrics: true
+  metrics_interval_seconds: 60
