@@ -5,6 +5,7 @@ Replaces the massive if/elif chains with clean, extensible handlers
 from abc import ABC, abstractmethod
 from typing import Optional, Any
 import logging
+from MetaQuery import is_agent_meta_query
 
 
 class CommandHandler(ABC):
@@ -270,6 +271,8 @@ class FileCreationCommandHandler(CommandHandler):
     async def can_handle(self, user_input: str) -> bool:
         import re
         lower = user_input.lower()
+        if is_agent_meta_query(lower):
+            return False
         
         # Use regex for more flexible matching (handles "create a folder", "make a file", etc.)
         patterns = [

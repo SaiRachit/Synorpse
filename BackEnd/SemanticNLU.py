@@ -8,6 +8,7 @@ from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass, field, asdict
 from groq import Groq
 from dotenv import dotenv_values
+from MetaQuery import is_agent_meta_query
 
 env_vars = dotenv_values(".env")
 GROQ_API_KEY = env_vars.get("GroqAPIKey")
@@ -527,7 +528,7 @@ OUTPUT FORMAT (JSON only, no other text):
             )
         
         # PRIORITY CHECK: Self-referential queries should go to general_chat
-        if self._is_self_referential_query(query):
+        if self._is_self_referential_query(query) or is_agent_meta_query(query):
             return NLUResult(
                 intent="general_chat",
                 confidence=0.95,

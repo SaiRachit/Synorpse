@@ -9,6 +9,7 @@ from functools import lru_cache
 from groq import Groq
 from dotenv import dotenv_values
 import time
+from MetaQuery import is_agent_meta_query
 
 logger = logging.getLogger("IntentRouter")
 
@@ -155,6 +156,11 @@ class IntentRouterFixed:
         """
         start_time = time.time()
         self.stats['total_queries'] += 1
+
+        if is_agent_meta_query(query):
+            if self.semantic_nlu:
+                self.semantic_nlu.clear_pending_action()
+            return [f"reasoning {query}"]
         
         # Step -1: Check for greetings FIRST (highest priority for instant feel)
         if self.GREETING_PATTERN.search(query) and len(query.split()) <= 6:

@@ -40,6 +40,7 @@ from NotificationSystem import get_notification_system
 from CommandChain import get_command_chain_executor, is_chain_command, CommandChainParser
 from ChainHandlers import get_chain_handlers
 from ReasoningHandlers import get_reasoning_handlers
+from MetaQuery import is_agent_meta_query
 
 config = None
 logger = None
@@ -400,6 +401,17 @@ async def process_user_command(user_input: str) -> str:
     audit_logger.log_command(username, user_input[:100])
     
     save_message("user", user_input)
+
+    if is_agent_meta_query(user_input):
+        try:
+            from SemanticNLU import get_semantic_nlu
+            get_semantic_nlu().clear_pending_action()
+        except Exception:
+            pass
+        response = await execute_with_reasoning(user_input)
+        save_message("assistant", response)
+        conversation_context.add_turn(user_input, response)
+        return response
     
   
     if chain_parser and is_chain_command(user_input):

@@ -41,6 +41,12 @@ _current_key_index = 0
 client = Groq(api_key=GROQ_KEYS[0]) if GROQ_KEYS else None
 async_client = AsyncGroq(api_key=GROQ_KEYS[0]) if GROQ_KEYS else None
 
+def _get_current_groq_api_key() -> Optional[str]:
+    """Expose the active Groq key for optional LangChain wrappers."""
+    if not GROQ_KEYS:
+        return None
+    return GROQ_KEYS[_current_key_index]
+
 def rotate_groq_key():
     """Rotate to the next available Groq key"""
     global _current_key_index, client, async_client
@@ -823,6 +829,247 @@ async def _simple_realtime_search(prompt):
     
     return best_answer.strip()
 
+
+def _get_relevant_reasoning_memories(goal: str, limit: int = 3) -> str:
+    """Retrieve compact prior reasoning outcomes that may help this task."""
+    goal_terms = [term for term in re.findall(r"[a-zA-Z0-9_]{4,}", goal.lower()) if term]
+    if not goal_terms:
+        return ""
+
+    try:
+        conn = psycopg2.connect(
+            dbname=DB_NAME, user=DB_USER,
+            password=DB_PASSWORD, host=DB_HOST
+        )
+        cur = conn.cursor()
+        cur.execute(
+            """SELECT goal, final_answer, confidence, created_at
+               FROM reasoning_traces
+               WHERE final_answer IS NOT NULL
+               ORDER BY created_at DESC
+               LIMIT 25"""
+        )
+        rows = cur.fetchall()
+        conn.close()
+    except Exception:
+        return ""
+
+    scored = []
+    for previous_goal, answer, confidence, created_at in rows:
+        haystack = f"{previous_goal} {answer}".lower()
+        score = sum(1 for term in goal_terms if term in haystack)
+        if score:
+            scored.append((score, previous_goal, answer, confidence, created_at))
+
+    if not scored:
+        return ""
+
+    scored.sort(key=lambda item: (item[0], item[3] or 0), reverse=True)
+    lines = ["Relevant prior memories:"]
+    for _, previous_goal, answer, confidence, created_at in scored[:limit]:
+        compact_answer = re.sub(r"\s+", " ", str(answer or ""))[:350]
+        lines.append(
+            f"- Goal: {previous_goal}\n  Outcome: {compact_answer}\n  Confidence: {confidence or 0}/100; Time: {created_at}"
+        )
+    return "\n".join(lines)
+
+
+def _build_actions_description(handlers: Dict[str, Any]) -> str:
+    """Build the action menu from live handlers plus the central capability registry."""
+    handler_specs = {
+        "search": {
+            "summary": "Search the web for current information.",
+            "input": {"query": "string"},
+            "capabilities": ["realtime_search", "google_search"]
+        },
+        "search_knowledge": {
+            "summary": "Answer a knowledge question using search-backed AI reasoning.",
+            "input": {"question": "string"},
+            "capabilities": ["chat", "realtime_search"]
+        },
+        "chat": {
+            "summary": "Answer a knowledge question using search-backed AI reasoning.",
+            "input": {"question": "string"},
+            "capabilities": ["chat"]
+        },
+        "create_file": {
+            "summary": "Create a document or code file.",
+            "input": {"file_type": "python|word|pdf|text|markdown", "topic": "string"},
+            "capabilities": []
+        },
+        "send_message": {
+            "summary": "Send a WhatsApp message or email. Use only when the user clearly asks to send.",
+            "input": {"recipient": "string", "message": "string", "method": "whatsapp|email"},
+            "capabilities": ["send_whatsapp", "send_email"]
+        },
+        "open_app": {
+            "summary": "Open a desktop application.",
+            "input": {"app_name": "string"},
+            "capabilities": ["open_app"]
+        },
+        "generate_image": {
+            "summary": "Generate an AI image from a text prompt.",
+            "input": {"prompt": "string"},
+            "capabilities": ["generate_image"]
+        },
+        "read_screen": {
+            "summary": "Capture and analyze the current screen content.",
+            "input": {"query": "string"},
+            "capabilities": []
+        },
+        "read_document": {
+            "summary": "Read and query the active or uploaded document.",
+            "input": {"query": "string"},
+            "capabilities": ["read_document"]
+        },
+        "finish": {
+            "summary": "Complete the task with a direct final answer.",
+            "input": {"answer": "string"},
+            "capabilities": []
+        }
+    }
+
+    capability_lookup = {}
+    try:
+        from CapabilityRegistry import get_capability_registry
+        registry = get_capability_registry()
+        capability_lookup = {cap.id: cap for cap in registry.get_all_capabilities()}
+    except Exception:
+        capability_lookup = {}
+
+    lines = []
+    for name in sorted(handlers.keys()):
+        spec = handler_specs.get(name, {
+            "summary": "Callable tool exposed by the system.",
+            "input": {},
+            "capabilities": []
+        })
+        details = []
+        for capability_id in spec.get("capabilities", []):
+            capability = capability_lookup.get(capability_id)
+            if capability:
+                examples = "; ".join(capability.examples[:2])
+                confirmation = " Requires confirmation for risky use." if capability.requires_confirmation else ""
+                details.append(
+                    f"{capability.name}: {capability.description}"
+                    f"{confirmation}"
+                    f"{' Examples: ' + examples if examples else ''}"
+                )
+
+        input_schema = json.dumps(spec["input"], ensure_ascii=True)
+        line = f"- {name}: {spec['summary']} Input: {input_schema}"
+        if details:
+            line += " Capabilities: " + " | ".join(details)
+        lines.append(line)
+
+    return "\n".join(lines)
+
+
+def _is_capability_meta_goal(goal: str) -> bool:
+    """Detect questions about the assistant's own tools or decision process."""
+    goal_lower = goal.lower()
+    patterns = [
+        r'\bwhat\s+(?:tools|capabilities|functions)\s+(?:do|can)\s+you\b',
+        r'\bwhat\s+can\s+you\s+do\b',
+        r'\bi\s+want\s+to\s+understand\s+what\s+capabilities\s+you\s+have\b',
+        r'\bhow\s+(?:would|do)\s+you\s+(?:decide|choose|use|plan|order)\b',
+        r'\bavailable\s+(?:tools|capabilities|actions)\b',
+        r'\btool\s+(?:selection|order|workflow|use)\b',
+        r'\bcapabilit(?:y|ies)\b.*\b(?:useful|tasks|order|decide)\b',
+    ]
+    return any(re.search(pattern, goal_lower) for pattern in patterns)
+
+
+def _is_screen_goal(goal: str) -> bool:
+    """Return True only when the user actually asks about visible screen content."""
+    goal_lower = goal.lower()
+    screen_terms = [
+        "screen", "display", "monitor", "looking at", "look at",
+        "see on my", "on my screen", "visible", "shown here",
+        "this image", "this picture", "screenshot", "window", "page"
+    ]
+    return any(term in goal_lower for term in screen_terms)
+
+
+def _screen_answer_style(goal: str) -> str:
+    """Keep screen-derived answers focused on the user request."""
+    goal_lower = goal.lower()
+    if (
+        "what task" in goal_lower
+        or "working on" in goal_lower
+        or "current task" in goal_lower
+        or "what problem" in goal_lower
+    ):
+        return (
+            "Answer in 2-4 short bullets. Mention only the main task, platform/problem if visible, "
+            "language/code state if visible, and one useful next step. "
+            "Do not mention weather, date/time, taskbar icons, OS, language settings, or speculative user details."
+        )
+
+    return (
+        "Answer the screen question directly and concisely. Include only details relevant to the request. "
+        "Do not mention weather, date/time, taskbar icons, OS, language settings, or background UI unless asked. "
+        "Do not expose hidden chain-of-thought."
+    )
+
+
+def _answer_relevance_contract(goal: str) -> str:
+    """General contract: observe broadly, answer only what was asked."""
+    return (
+        "You may use all available context, memory, and observations internally, but the final answer must stay scoped to the user's actual request. "
+        "Do not dump incidental details, debug metadata, tool schemas, environment facts, trace IDs, weather/date/taskbar/OS details, or speculative profile guesses unless the user asks for them. "
+        "If the user asks 'what is happening' or 'what am I working on', give the main task and the most useful next step. "
+        "If important details are missing for an action, ask only for those missing details."
+    )
+
+
+def _is_self_contained_reasoning_goal(goal: str) -> bool:
+    """Detect puzzles/math/logic tasks that should be solved directly."""
+    goal_lower = goal.lower()
+    patterns = [
+        r'\b(?:riddle|puzzle|brainteaser|trick question|logic)\b',
+        r'\b(?:solve|work out|figure out)\b.*\b(?:step by step|logically|reason)\b',
+        r'\b(?:coins?|balance scale|weigh|weighing)\b',
+        r'\b(?:sequence|series|pattern)\b',
+        r'\b(?:if|suppose)\b.*\b(?:how many|what happens|which|who)\b',
+    ]
+    return any(re.search(pattern, goal_lower) for pattern in patterns)
+
+
+def _answer_capability_meta_goal(goal: str, actions_desc: str) -> str:
+    """Answer capability/tool-selection questions without invoking external tools."""
+    try:
+        import sys as _sys
+        from LangChainReasoning import get_langchain_status
+        lc_status = get_langchain_status()
+        planner_status = (
+            f"LangChain planning is available in {_sys.executable}."
+            if lc_status.get("available")
+            else (
+                "LangChain planning is configured as optional, but this running Python process "
+                f"cannot import it from {_sys.executable}. "
+                f"Import error: {lc_status.get('error') or 'unknown'}; using the Groq fallback planner."
+            )
+        )
+    except Exception:
+        planner_status = "Structured planning is active through the built-in fallback."
+
+    return (
+        "I would treat that as a planning problem first, not immediately execute every tool.\n\n"
+        "My order would usually be:\n"
+        "1. Clarify the actual goal, topic, recipient, file type, and delivery method if any are missing.\n"
+        "2. Choose an information tool when the request needs current or unknown facts.\n"
+        "3. Use the result as context for a creation tool if the user asked for a document, code file, report, or image.\n"
+        "4. Use a messaging tool only after the content exists and the recipient/method are clear.\n"
+        "5. Store the final outcome and trace so a later session can reuse the useful context.\n\n"
+        f"Planner status: {planner_status}\n\n"
+        "Right now the reasoning loop can choose from these live actions:\n"
+        f"{actions_desc}\n\n"
+        "For your example, if you literally asked me to research a topic, create a document, and send it, "
+        "I should not invent placeholders like 'unknown' or 'someone'. I should ask for missing details first, "
+        "then run: search -> create_file -> send_message."
+    )
+
 async def run_reasoning_loop(goal: str, context: str = None, 
                            on_thought: Callable[[str], None] = None) -> dict:
     """
@@ -836,8 +1083,29 @@ async def run_reasoning_loop(goal: str, context: str = None,
         return {"answer": "Reasoning handlers not initialized.", "trace_id": None, "verified": False, "confidence": 0}
     
     handlers = handlers_obj.get_handlers_dict()
+    actions_desc = _build_actions_description(handlers)
+    relevant_memories = _get_relevant_reasoning_memories(goal)
     start_time = time.time()
     trace = ReasoningTrace(goal=goal)
+
+    if _is_capability_meta_goal(goal):
+        answer = _answer_capability_meta_goal(goal, actions_desc)
+        trace.add_step(ThoughtStep(
+            thought="This is a meta question about tool choice, so I should explain capabilities instead of executing tools.",
+            action="finish",
+            action_input={"answer": answer},
+            observation="Answered directly from the live action registry."
+        ))
+        trace.final_answer = answer
+        trace.success = True
+        trace.total_time = time.time() - start_time
+        trace_id = save_reasoning_trace(trace, verified=True, confidence=90)
+        return {
+            "answer": trace.final_answer,
+            "trace_id": trace_id,
+            "verified": True,
+            "confidence": 90
+        }
     
     state = ReasoningState.THINKING
     step_count = 0
@@ -852,12 +1120,16 @@ async def run_reasoning_loop(goal: str, context: str = None,
         step_count += 1
         
         # THINK
-        thought_result = await _think_react(goal, trace, context, handlers)
+        thought_result = await _think_react(
+            goal, trace, context, handlers, actions_desc, relevant_memories
+        )
         
         if not thought_result:
             # Retry with key rotation
             rotate_groq_key()
-            thought_result = await _think_react(goal, trace, context, handlers)
+            thought_result = await _think_react(
+                goal, trace, context, handlers, actions_desc, relevant_memories
+            )
             
             if not thought_result:
                 return {"answer": "I encountered an error while thinking. Please check your connection.",
@@ -871,15 +1143,27 @@ async def run_reasoning_loop(goal: str, context: str = None,
         
         # --- Hard guard: prevent premature finishing ---
         _goal_lower = goal.lower()
-        _is_screen_goal = any(w in _goal_lower for w in ["screen", "display", "looking at", "see on my", "on my monitor"])
+        _screen_goal = _is_screen_goal(goal)
+        _self_contained_reasoning = _is_self_contained_reasoning_goal(goal)
         # Check if we have a screen observation in steps OR in the initial context
         _has_screen_observation = any(
             s.action == "read_screen" and s.observation for s in trace.steps
         ) or (context and "SCREEN" in context.upper())
+
+        if action == "read_screen" and not _screen_goal:
+            action = "search_knowledge"
+            action_input = {"question": goal}
+            step = ThoughtStep(
+                thought="[Auto-corrected] This request is not about the screen, so I should reason from the prompt instead of reading the display.",
+                action=action,
+                action_input=action_input
+            )
+            if on_thought:
+                on_thought(" This does not need screen reading - reasoning from the prompt.")
         
         if action == "finish":
             # BLOCK: Screen-related goal but haven't read the screen yet
-            if _is_screen_goal and not _has_screen_observation and "read_screen" in handlers:
+            if _screen_goal and not _has_screen_observation and "read_screen" in handlers:
                 action = "read_screen"
                 action_input = {"query": goal}
                 step = ThoughtStep(
@@ -889,7 +1173,7 @@ async def run_reasoning_loop(goal: str, context: str = None,
                 if on_thought:
                     on_thought(" Reading your screen first...")
             # BLOCK: First step — must gather info before finishing (unless context provided)
-            elif step_count == 1 and not (context and len(context) > 100):
+            elif step_count == 1 and not (context and len(context) > 100) and not _self_contained_reasoning:
                 action = "search" if "search" in handlers else "search_knowledge"
                 action_input = {"query": goal} if action == "search" else {"question": goal}
                 step = ThoughtStep(
@@ -923,18 +1207,14 @@ USER'S REQUEST: {goal}
 SCREEN CONTENT:
 {screen_data[:3000]}
 
-IMPORTANT: Walk the user through your reasoning:
-1. First, describe what you observe on their screen (game state, puzzle, riddle text, etc.)
-2. Analyze the key details (e.g., which letters are correct/wrong, what clues are given)
-3. Explain your reasoning process
-4. Give your recommendation or answer
-
-Be specific about what you see — reference colors, positions, letters, numbers, or any visual details. Think WITH the user, not just AT them."""
+IMPORTANT:
+{_screen_answer_style(goal)}
+Be specific where useful, but do not dump every visible detail."""
                             
                             solve_response = await _async_call_with_retry(
                                 model=MODEL_LIGHT,
                                 messages=[
-                                    {"role": "system", "content": "You are an intelligent screen companion. You can see the user's screen and help them solve puzzles, games, and problems by thinking through them step by step. Always reference specific visual details from the screen data."},
+                                    {"role": "system", "content": "You are an intelligent screen companion. Answer the user's screen request directly and concisely. Mention only visual details relevant to the request."},
                                     {"role": "user", "content": solve_prompt}
                                 ],
                                 temperature=0.4,
@@ -977,18 +1257,14 @@ USER'S REQUEST: {goal}
 SCREEN CONTENT:
 {existing_screen[:3000]}
 
-IMPORTANT: Walk the user through your reasoning:
-1. First, describe what you observe on their screen (game state, puzzle, riddle text, etc.)
-2. Analyze the key details (e.g., which letters are correct/wrong, what clues are given)
-3. Explain your reasoning process
-4. Give your recommendation or answer
-
-Be specific about what you see — reference colors, positions, letters, numbers, or any visual details. Think WITH the user, not just AT them."""
+IMPORTANT:
+{_screen_answer_style(goal)}
+Be specific where useful, but do not dump every visible detail."""
                     
                     solve_response = await _async_call_with_retry(
                         model=MODEL_LIGHT,
                         messages=[
-                            {"role": "system", "content": "You are an intelligent screen companion. You can see the user's screen and help them solve puzzles, games, and problems by thinking through them step by step. Always reference specific visual details from the screen data."},
+                            {"role": "system", "content": "You are an intelligent screen companion. Answer the user's screen request directly and concisely. Mention only visual details relevant to the request."},
                             {"role": "user", "content": solve_prompt}
                         ],
                         temperature=0.4,
@@ -1033,12 +1309,12 @@ Be specific about what you see — reference colors, positions, letters, numbers
         # Screen-based goals with screen observations: skip web verification
         # (DuckDuckGo can't verify answers derived from visual screen analysis)
         _goal_lower = goal.lower()
-        _is_screen_goal = any(w in _goal_lower for w in ["screen", "display", "looking at", "see on my", "on my monitor"])
+        _screen_goal = _is_screen_goal(goal)
         _has_screen_obs = any(
             s.action == "read_screen" and s.observation for s in trace.steps
         ) or (context and "SCREEN" in context.upper())
         
-        if _is_screen_goal and _has_screen_obs:
+        if _screen_goal and _has_screen_obs:
             # Trust the visual observation — web search can't verify this
             confidence = 75
             verified = True
@@ -1085,37 +1361,64 @@ Be specific about what you see — reference colors, positions, letters, numbers
         "confidence": confidence
     }
 
-async def _think_react(goal: str, trace: ReasoningTrace, context: str, handlers: Dict) -> Optional[tuple]:
+async def _think_react(
+    goal: str,
+    trace: ReasoningTrace,
+    context: str,
+    handlers: Dict,
+    actions_desc: str,
+    relevant_memories: str = ""
+) -> Optional[tuple]:
     """Internal ReAct thinking logic"""
     if not async_client:
         return None
     
-    # Available actions description
-    AVAILABLE_ACTIONS_DESC = {
-        "search": "Search the web for current information. Input: {query: string}",
-        "search_knowledge": "Answer a knowledge question using search-backed AI reasoning. Input: {question: string}",
-        "create_file": "Create a document or code file. Input: {file_type: string, topic: string}",
-        "send_message": "Send via WhatsApp or email. Input: {recipient: string, message: string, method: 'whatsapp'|'email'}",
-        "open_app": "Open an application. Input: {app_name: string}",
-        "generate_image": "Generate an AI image. Input: {prompt: string}",
-        "read_screen": "Capture and analyze the current screen content. Input: {query: string}",
-        "read_document": "Read and query the active/uploaded document. Input: {query: string}",
-        "finish": "Complete the task with a CONCISE, direct final answer. Input: {answer: string}"
-    }
-    
-    actions_desc = "\n".join([f"- {name}: {AVAILABLE_ACTIONS_DESC[name]}" for name in handlers if name in AVAILABLE_ACTIONS_DESC])
     trace_context = trace.get_context() if trace.steps else "No previous steps."
+    action_names = ", ".join(sorted(handlers.keys()))
+
+    try:
+        from LangChainReasoning import LangChainReasoningPlanner
+
+        planner = LangChainReasoningPlanner(
+            model=MODEL_LIGHT,
+            api_key_getter=_get_current_groq_api_key,
+            fallback_call=_async_call_with_retry,
+            temperature=0.2,
+        )
+        planned = await planner.plan_next(
+            goal=goal,
+            context=context,
+            memory=relevant_memories,
+            trace_context=trace_context,
+            actions_desc=actions_desc,
+            action_names=action_names,
+        )
+        if planned:
+            return planned
+    except Exception:
+        pass
     
     prompt = f"""You are an autonomous Critical Thinking Engine.
 GOAL: {goal}
 {f"CONTEXT: {context}" if context else ""}
+{f"MEMORY: {relevant_memories}" if relevant_memories else ""}
 PREVIOUS STEPS:
 {trace_context}
 AVAILABLE ACTIONS:
 {actions_desc}
 
+ANSWER RELEVANCE CONTRACT:
+{_answer_relevance_contract(goal)}
+
 CRITICAL RULES:
-1. If the goal mentions "screen", "display", "looking at", "see", or "on my screen", you MUST use "read_screen" FIRST before anything else — UNLESS the CONTEXT already contains screen analysis data (e.g. "INITIAL SCREEN ANALYSIS").
+0. Choose exactly one action from this list: {action_names}.
+0.1 Use tools intentionally: search for current or unknown facts, read_screen for visual tasks, read_document for active documents, create_file for requested files, generate_image for image creation, open_app for launching apps, and send_message only when the user explicitly asked to send.
+0.2 If the task needs multiple capabilities, make a short internal plan in the thought, call one tool, observe, then continue.
+0.3 Never use "finish" as your first action unless CONTEXT or MEMORY already provides enough information to answer the goal directly.
+0.4 The final answer in "finish" must be based on observations, CONTEXT, or MEMORY. Do not give generic or placeholder answers.
+0.5 If an observation shows an error, adjust by choosing another available action or finish with a clear limitation.
+0.6 Do not use read_screen unless the user's goal explicitly asks about the screen, display, visible page, window, image, or something "shown here".
+1. If the goal mentions "screen", "display", "looking at", "see", or "on my screen", you MUST use "read_screen" FIRST before anything else - UNLESS the CONTEXT already contains screen analysis data (e.g. "INITIAL SCREEN ANALYSIS").
 2. NEVER use "finish" as your first action UNLESS the CONTEXT already provides sufficient information to answer the goal directly.
 3. Your final answer in "finish" MUST be based on the observations from previous steps or from the CONTEXT — do NOT give generic/placeholder answers.
 4. If you already have observations from previous steps, use them to formulate a specific, accurate answer.

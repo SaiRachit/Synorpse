@@ -40,6 +40,7 @@ from NotificationSystem import get_notification_system
 from CommandChain import get_command_chain_executor, is_chain_command, CommandChainParser
 from ChainHandlers import get_chain_handlers
 from ReasoningHandlers import get_reasoning_handlers
+from MetaQuery import is_agent_meta_query
 
 config = None
 logger = None
@@ -147,6 +148,7 @@ def initialize_systems():
         async_search, async_chatbot, async_image_gen,
         async_automation, file_creator,
         analyze_screen=analyze_screen,
+        conversation_context=conversation_context,
         phonebook=PHONEBOOK
     )
     
@@ -245,15 +247,27 @@ async def execute_with_reasoning(goal: str, context: str = None) -> str:
             """Callback to display thoughts in real-time"""
             print(f"\n{thought}", flush=True)
         
+        reasoning_context = context or ""
+        try:
+            recent_context = conversation_context.get_context_for_ai(include_turns=5)
+            if recent_context:
+                reasoning_context = f"{reasoning_context}\n\nSESSION CONTEXT:\n{recent_context}".strip()
+        except Exception:
+            pass
+
         with timer(f"Reasoning: {goal[:30]}...", logger):
-            response = await async_search.search(
-                query=goal,
+            from RealTimeSearchEngine import run_reasoning_loop
+            result = await run_reasoning_loop(
+                goal,
                 on_thought=on_thought,
-                context=context,
-                force_reasoning=True
+                context=reasoning_context
             )
         
-        return response
+        if isinstance(result, dict):
+            answer = result.get("answer") or "I finished the reasoning loop but did not produce an answer."
+            return answer
+
+        return str(result)
             
     except Exception as e:
         logger.error(f"Reasoning execution failed: {e}", exc_info=True)
@@ -404,6 +418,17 @@ async def process_user_command(user_input: str) -> str:
     audit_logger.log_command(username, user_input[:100])
     
     save_message("user", user_input)
+
+    if is_agent_meta_query(user_input):
+        try:
+            from SemanticNLU import get_semantic_nlu
+            get_semantic_nlu().clear_pending_action()
+        except Exception:
+            pass
+        response = await execute_with_reasoning(user_input)
+        save_message("assistant", response)
+        conversation_context.add_turn(user_input, response)
+        return response
     
   
     if chain_parser and is_chain_command(user_input):
@@ -451,6 +476,13 @@ async def process_user_command(user_input: str) -> str:
     if user_input.lower() == 'clear':
         clear_chat_history()
         return " Chat history cleared"
+
+    if user_input.lower() in [
+        'show reasoning', 'last reasoning', 'reasoning trace',
+        'how did you reason', 'show trace'
+    ]:
+        from RealTimeSearchEngine import get_reasoning_trace, format_trace_for_user
+        return format_trace_for_user(get_reasoning_trace())
     
     if user_input.lower() == 'logs':
         logs = get_automation_logs(15)

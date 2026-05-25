@@ -128,6 +128,11 @@ search_circuit = None
 import time as _time
 _last_screen_context = {"data": None, "query": None, "timestamp": 0}
 
+CHAT_TIMEOUT_SECONDS = 75
+REASONING_TIMEOUT_SECONDS = 120
+SCREEN_TIMEOUT_SECONDS = 45
+PROCESS_TIMEOUT_SECONDS = 150
+
 try:
     from ConfigManager import get_config
     from LoggingConfig import setup_logging, get_logger, get_performance_logger, timer
@@ -155,6 +160,7 @@ try:
     from CommandChain import get_command_chain_executor, is_chain_command, CommandChainParser
     from ChainHandlers import get_chain_handlers
     from ReasoningHandlers import get_reasoning_handlers
+    from MetaQuery import is_agent_meta_query
 
     BACKEND_AVAILABLE = True
 except Exception as e:
@@ -361,24 +367,70 @@ def _needs_critical_thinking(query: str) -> bool:
     """Detect if a query needs the autonomous reasoning loop."""
     return any(p.search(query) for p in _CRITICAL_THINKING_PATTERNS)
 
-async def execute_with_reasoning(goal, context=None, on_thought=None):
-    """Execute using unified reasoning loop in search engine."""
-    try:
-        # Use global conversation_context if no explicit context provided
-        if context is None and conversation_context:
-            context = conversation_context.get_recent_context()
 
-        # force_reasoning=True bypasses the _needs_reasoning() heuristic entirely,
-        # so even queries that don't match regex patterns will go through the full
-        # ReAct loop when explicitly routed here by the intent system.
-        result = await async_search.search(
-            goal, on_thought=on_thought, context=context, force_reasoning=True
+async def _await_with_timeout(coro, seconds: int, label: str):
+    """Prevent model/network stalls from leaving the UI in a thinking state."""
+    try:
+        return await asyncio.wait_for(coro, timeout=seconds)
+    except asyncio.TimeoutError:
+        return (
+            f"I got stuck waiting on {label}. Please try again with a smaller request, "
+            "or ask me to continue from the last screen/context."
         )
+
+
+def _recent_screen_context(max_age_seconds: int = 300) -> str:
+    """Return cached screen analysis if it is still fresh."""
+    if not _last_screen_context["data"]:
+        return ""
+    if _time.time() - _last_screen_context["timestamp"] > max_age_seconds:
+        return ""
+    return str(_last_screen_context["data"])
+
+
+def _is_screen_followup_request(query: str) -> bool:
+    """Detect follow-ups that refer to the previously analyzed screen."""
+    if not _recent_screen_context():
+        return False
+    q = query.lower().strip()
+    followup_terms = [
+        "this", "that", "it", "the code", "code", "solution", "solve",
+        "implement", "write", "give me", "fix", "explain", "continue"
+    ]
+    return any(term in q for term in followup_terms)
+
+
+async def execute_with_reasoning(goal, context=None, on_thought=None):
+    """Execute using the unified ReAct loop directly."""
+    try:
+        reasoning_context = context or ""
+        if conversation_context:
+            try:
+                recent_context = conversation_context.get_context_for_ai(include_turns=5)
+                if recent_context:
+                    reasoning_context = f"{reasoning_context}\n\nSESSION CONTEXT:\n{recent_context}".strip()
+            except Exception:
+                pass
+
+        from RealTimeSearchEngine import run_reasoning_loop
+        result = await _await_with_timeout(
+            run_reasoning_loop(
+                goal,
+                on_thought=on_thought,
+                context=reasoning_context
+            ),
+            REASONING_TIMEOUT_SECONDS,
+            "the reasoning engine"
+        )
+
+        if isinstance(result, str):
+            return result
 
         # run_reasoning_loop now returns a dict; simple search returns a string
         if isinstance(result, dict):
-            return result.get("answer", str(result))
-        return result
+            answer = result.get("answer") or "I finished the reasoning loop but did not produce an answer."
+            return answer
+        return str(result)
     except Exception as e:
         return f"❌ Error during reasoning: {str(e)}"
 
@@ -507,6 +559,22 @@ async def process_user_command(user_input, state_callback=None, thinking_callbac
 
     save_message("user", user_input)
 
+    # Meta/workflow questions should explain planning, not trigger tools that
+    # happen to be mentioned inside the question.
+    if is_agent_meta_query(user_input):
+        try:
+            from SemanticNLU import get_semantic_nlu
+            get_semantic_nlu().clear_pending_action()
+        except Exception:
+            pass
+        if state_callback:
+            state_callback('processing')
+        response = await execute_with_reasoning(user_input, on_thought=thinking_callback)
+        save_message("assistant", response)
+        if conversation_context:
+            conversation_context.add_turn(user_input, response)
+        return response
+
     # --- 1. Command chains ("create file and send on whatsapp") ---
     if chain_parser and is_chain_command(user_input):
         if state_callback:
@@ -567,6 +635,12 @@ async def process_user_command(user_input, state_callback=None, thinking_callbac
         clear_chat_history()
         return "✅ Chat history cleared"
 
+    if user_input.lower() in [
+        'show reasoning', 'last reasoning', 'reasoning trace',
+        'how did you reason', 'show trace'
+    ]:
+        return format_trace_for_user(get_reasoning_trace())
+
     if user_input.lower() == 'logs':
         logs = get_automation_logs(15)
         if logs:
@@ -597,6 +671,26 @@ async def process_user_command(user_input, state_callback=None, thinking_callbac
             return response
         except Exception:
             pass  # Fall through to normal processing
+
+    # --- 5.55 Follow-up to the last screen analysis ---
+    # Example: user first asks "look at my screen", then "give me the code".
+    if _is_screen_followup_request(user_input):
+        if state_callback:
+            state_callback('processing')
+
+        screen_ctx = _recent_screen_context()
+        context = (
+            "RECENT SCREEN ANALYSIS:\n"
+            f"{screen_ctx[:3000]}\n\n"
+            "Use this as the visual context for the user's follow-up. "
+            "Answer only the follow-up request; do not repeat unrelated screen details."
+        )
+
+        response = await execute_with_reasoning(user_input, context=context, on_thought=thinking_callback)
+        save_message("assistant", response)
+        if conversation_context:
+            conversation_context.add_turn(user_input, response)
+        return response
 
     # --- 5.6 Auto-route critical thinking queries through reasoning ---
     is_critical = _needs_critical_thinking(user_input)
@@ -630,7 +724,11 @@ async def process_user_command(user_input, state_callback=None, thinking_callbac
             if thinking_callback:
                 thinking_callback(" Analyzing your screen first...")
             try:
-                screen_data = await analyze_screen(user_input)
+                screen_data = await _await_with_timeout(
+                    analyze_screen(user_input),
+                    SCREEN_TIMEOUT_SECONDS,
+                    "screen analysis"
+                )
                 if screen_data:
                     context = f"INITIAL SCREEN ANALYSIS:\n{screen_data}\n\nUse this data to solve the user's request."
                     # Cache for follow-up questions
@@ -791,21 +889,32 @@ async def process_user_command(user_input, state_callback=None, thinking_callbac
         # --- General chat ---
         elif decision_type == "general":
             # Inject recent screen context for follow-up questions
-            _screen_age = _time.time() - _last_screen_context["timestamp"]
-            if _last_screen_context["data"] and _screen_age < 300:  # 5 min window
-                screen_ctx = _last_screen_context["data"]
+            screen_ctx = _recent_screen_context()
+            if screen_ctx:
                 augmented_query = (
                     f"[CONTEXT: The user was just looking at their screen. "
                     f"Here is what was on screen: {screen_ctx[:2000]}]\n\n"
                     f"User's follow-up question: {resolved_query}"
                 )
-                response = await chatbot_circuit(async_chatbot.query)(augmented_query)
+                response = await _await_with_timeout(
+                    chatbot_circuit(async_chatbot.query)(augmented_query),
+                    CHAT_TIMEOUT_SECONDS,
+                    "chat response"
+                )
             else:
-                response = await chatbot_circuit(async_chatbot.query)(resolved_query)
+                response = await _await_with_timeout(
+                    chatbot_circuit(async_chatbot.query)(resolved_query),
+                    CHAT_TIMEOUT_SECONDS,
+                    "chat response"
+                )
 
         # --- Realtime search ---
         elif decision_type == "realtime":
-            response = await search_circuit(async_search.search)(resolved_query)
+            response = await _await_with_timeout(
+                search_circuit(async_search.search)(resolved_query),
+                REASONING_TIMEOUT_SECONDS,
+                "real-time search"
+            )
 
         # --- File creation (handle both NLU and regex formats) ---
         elif decision_type == "create_file" or (decision.startswith("create ") and "file" in decision):
@@ -922,17 +1031,24 @@ async def process_user_command(user_input, state_callback=None, thinking_callbac
         # --- Fallback to chatbot ---
         else:
             # Check if recent screen analysis is available for follow-up context
-            _screen_age = _time.time() - _last_screen_context["timestamp"]
-            if _last_screen_context["data"] and _screen_age < 300:  # 5 min window
-                screen_ctx = _last_screen_context["data"]
+            screen_ctx = _recent_screen_context()
+            if screen_ctx:
                 augmented_query = (
                     f"[CONTEXT: The user was just looking at their screen. "
                     f"Here is what was on screen: {screen_ctx[:2000]}]\n\n"
                     f"User's follow-up question: {user_input}"
                 )
-                response = await chatbot_circuit(async_chatbot.query)(augmented_query)
+                response = await _await_with_timeout(
+                    chatbot_circuit(async_chatbot.query)(augmented_query),
+                    CHAT_TIMEOUT_SECONDS,
+                    "chat response"
+                )
             else:
-                response = await chatbot_circuit(async_chatbot.query)(user_input)
+                response = await _await_with_timeout(
+                    chatbot_circuit(async_chatbot.query)(user_input),
+                    CHAT_TIMEOUT_SECONDS,
+                    "chat response"
+                )
 
         save_message("assistant", response)
         if conversation_context:
@@ -1044,14 +1160,22 @@ class PythonBridge(QObject):
                 process_user_command(text, state_callback=state_cb, thinking_callback=thinking_cb, visibility_callback=visibility_cb)
             )
 
-            # Wait for result (with timeout)
-            response = future.result(timeout=300)
+            # Wait for result, but don't let backend/model stalls keep the UI spinning.
+            response = future.result(timeout=PROCESS_TIMEOUT_SECONDS)
 
             if response:
                 self.responseReady.emit(str(response))
             else:
                 self.responseReady.emit("I couldn't process that request.")
 
+        except TimeoutError:
+            try:
+                future.cancel()
+            except Exception:
+                pass
+            self.errorOccurred.emit(
+                "I got stuck waiting for the backend. Please try again, or ask a narrower follow-up."
+            )
         except Exception as e:
             _real_print(f"❌ Error processing message: {e}")
             self.errorOccurred.emit(str(e))

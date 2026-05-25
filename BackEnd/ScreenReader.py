@@ -91,6 +91,37 @@ def is_generic_request(question: str) -> bool:
     return any(re.match(pattern, q_lower) for pattern in generic_patterns)
 
 
+def is_task_identification_request(question: str) -> bool:
+    """Detect screen prompts asking what the user is working on."""
+    import re
+    q_lower = (question or "").lower().strip()
+    patterns = [
+        r'\bwhat\s+(?:am\s+i|task\s+am\s+i)\s+(?:working\s+on|doing)\b',
+        r'\bexplain\s+what\s+task\s+i\s+am\s+(?:currently\s+)?working\s+on\b',
+        r'\blook\s+at\s+(?:my\s+|the\s+)?screen\s+and\s+explain\s+what\s+task\b',
+        r'\bwhat\s+is\s+(?:my\s+)?current\s+task\b',
+        r'\bwhat\s+problem\s+am\s+i\s+(?:solving|working\s+on)\b',
+    ]
+    return any(re.search(pattern, q_lower) for pattern in patterns)
+
+
+def get_screen_answer_instructions(question: str) -> str:
+    """Style instructions tuned to the user's actual screen request."""
+    if is_task_identification_request(question):
+        return (
+            "Answer in 2-4 short bullets. Identify only the main task, the platform/app if visible, "
+            "the programming language if visible, and one useful next step. "
+            "Do not mention weather, date/time, taskbar icons, OS, language settings, or speculative user profile details. "
+            "Do not say 'based on the image content'."
+        )
+
+    return (
+        "Answer the user's screen question directly and concisely. Include only details relevant to the request. "
+        "Do not mention weather, date/time, taskbar icons, OS, language settings, or background UI unless the user asks. "
+        "Avoid guessing demographics, skill level, or motivations."
+    )
+
+
 async def analyze_screen(question: str = "") -> str:
     """
     Capture the screen and ask the Groq Vision model about it.
@@ -99,6 +130,7 @@ async def analyze_screen(question: str = "") -> str:
         return "❌ Screen reader unavailable — GroqScreenReader API key not configured."
 
     prompt = question.strip() if question.strip() else DEFAULT_QUESTION
+    answer_instructions = get_screen_answer_instructions(prompt)
 
     # 1. Check for generic request
     if is_generic_request(prompt):
@@ -120,6 +152,7 @@ async def analyze_screen(question: str = "") -> str:
     try:
         # 1. Capture - run in thread since it uses mss which is sync
         image_b64 = await asyncio.to_thread(capture_screen)
+        max_answer_tokens = 350 if is_task_identification_request(prompt) else 700
 
         # 2. Send to vision model
         response = await groq_client.chat.completions.create(
@@ -130,7 +163,7 @@ async def analyze_screen(question: str = "") -> str:
                     "content": (
                         "You are Synorpse, a desktop assistant with vision capabilities. "
                         "You have been provided with a screenshot of the user's primary monitor. "
-                        "Analyze the image content to answer the user's request accurately. "
+                        "Analyze the image content to answer the user's request accurately and concisely. "
                         "Do not say you cannot see the screen — the image is attached below."
                     )
                 },
@@ -139,7 +172,14 @@ async def analyze_screen(question: str = "") -> str:
                     "content": [
                         {
                             "type": "text",
-                            "text": f"User Prompt: {prompt}\n\nTask: Analyze the user's screen and provide a detailed answer. \n\nCRITICAL INSTRUCTIONS:\n1. IDENTIFY ENTITIES: Explicitly name any landmarks, companies, people, error codes, street signs, or unique URLs visible.\n2. PROVIDE CONTEXT: If identifying a location (like in Geoguessr), describe specific visual clues (flags, road lines, architecture, vegetation).\n3. SEARCHABLE DATA: Wrap any key entities that should be verified online in square brackets, e.g., [Nigeria National Mosque] or [Error 0x80041010].\n4. BE OUTSIDE THE BOX: Don't just describe the pixels; tell the user what they are looking at in the real world.",
+                            "text": (
+                                f"User Prompt: {prompt}\n\n"
+                                f"Response style: {answer_instructions}\n\n"
+                                "Task: Use the screenshot to answer the user's request. "
+                                "Name important visible entities only when they are relevant to the request. "
+                                "For location-identification tasks, describe visual clues. "
+                                "For coding/problem-solving tasks, focus on the problem, language, visible code state, and next step."
+                            ),
                         },
                         {
                             "type": "image_url",
@@ -150,7 +190,7 @@ async def analyze_screen(question: str = "") -> str:
                     ],
                 }
             ],
-            max_tokens=1024,
+            max_tokens=max_answer_tokens,
             temperature=0.2,
         )
 

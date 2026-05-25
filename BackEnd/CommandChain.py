@@ -9,6 +9,7 @@ import logging
 import re
 from groq import Groq
 from dotenv import dotenv_values
+from MetaQuery import is_agent_meta_query
 
 env_vars = dotenv_values(".env")
 GROQ_API_KEY = env_vars.get("GroqAPIKey")
@@ -109,6 +110,12 @@ class CommandChainParser:
         Detect if a command contains multiple steps
         Look for connecting words like 'and', 'then', 'after'
         """
+        query_lower = query.lower().strip()
+
+        # Hypothetical/meta questions should be answered, not executed.
+        if is_agent_meta_query(query_lower):
+            return False
+
         # Keywords that suggest chaining
         chain_indicators = [
             r'\band\b.*\b(send|email|whatsapp|share)',
@@ -121,7 +128,6 @@ class CommandChainParser:
             r'\bon this\b',  # "create a document on this"
         ]
         
-        query_lower = query.lower()
         for pattern in chain_indicators:
             if re.search(pattern, query_lower):
                 logger.info(f"Detected chain command with pattern: {pattern}")
