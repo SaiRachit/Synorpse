@@ -990,6 +990,7 @@ def SendWhatsApp(query):
                 metadata={"query": query}
             )
         
+        
         return success
     except Exception as e:
         log_automation(
