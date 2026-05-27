@@ -38,7 +38,7 @@ os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = " ".join([
 from PyQt6.QtCore import (
     Qt, QUrl, QObject, pyqtSlot, pyqtSignal, QSize
 )
-from PyQt6.QtGui import QRegion
+from PyQt6.QtGui import QRegion, QColor
 from PyQt6.QtWidgets import QApplication, QMainWindow, QFileDialog
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore import QWebEngineSettings, QWebEnginePage
@@ -1244,7 +1244,21 @@ class SphereWindow(QMainWindow):
         self.webview.setPage(page)
 
         self.webview.setStyleSheet("background: transparent;")
-        page.setBackgroundColor(Qt.GlobalColor.transparent)
+        # Ensure the webview paints transparently and doesn't draw its own background
+        try:
+            self.webview.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+            self.webview.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+            self.webview.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
+        except Exception:
+            pass
+        # Prefer an explicit transparent QColor (fixes differing behavior across PyQt/Qt versions)
+        try:
+            page.setBackgroundColor(QColor(0, 0, 0, 0))
+        except Exception:
+            try:
+                page.setBackgroundColor(Qt.GlobalColor.transparent)
+            except Exception:
+                pass
 
         settings = self.webview.settings()
         settings.setAttribute(
@@ -1316,9 +1330,23 @@ class SphereWindow(QMainWindow):
     def _update_window_mask(self):
         if self._is_expanded:
             self.clearMask()
+            try:
+                # Also clear any mask on the webview when expanded
+                if hasattr(self, 'webview'):
+                    self.webview.clearMask()
+            except Exception:
+                pass
             return
 
-        self.setMask(QRegion(self.rect(), QRegion.RegionType.Ellipse))
+        # Apply an elliptical mask to the main window and the webview so
+        # the QWebEngine native surface doesn't show a rectangular border.
+        ellipse = QRegion(self.rect(), QRegion.RegionType.Ellipse)
+        self.setMask(ellipse)
+        try:
+            if hasattr(self, 'webview'):
+                self.webview.setMask(QRegion(self.webview.rect(), QRegion.RegionType.Ellipse))
+        except Exception:
+            pass
 
     def _expand(self):
         """Expand window to show the full chat panel."""

@@ -392,6 +392,8 @@ class ChatController {
         this.bridge = null;
 
         this.panel = document.getElementById('chat-panel');
+        // Start hidden to avoid any rendered chrome beneath the collapsed sphere
+        this.panel.style.display = 'none';
         this.messagesEl = document.getElementById('chat-messages');
         this.inputEl = document.getElementById('chat-input');
         this.sendBtn = document.getElementById('chat-send-btn');
@@ -496,7 +498,9 @@ class ChatController {
 
     open() {
         this.isOpen = true;
-        this.panel.classList.add('open');
+        // Make panel render before activating open class so transitions work
+        this.panel.style.display = 'flex';
+        requestAnimationFrame(() => this.panel.classList.add('open'));
         this.sphere.setState('listening');
         // Tell Python to expand the window so the chat panel area is interactive
         if (this.bridge && this.bridge.expandWindow) {
@@ -507,12 +511,15 @@ class ChatController {
 
     close() {
         this.isOpen = false;
+        // Start collapse transition, then remove from layout to avoid any chrome rendering
         this.panel.classList.remove('open');
         this.sphere.setState('idle');
         // Tell Python to collapse the window so area below sphere is clickable
         if (this.bridge && this.bridge.collapseWindow) {
             this.bridge.collapseWindow();
         }
+        // Match CSS transition duration (400ms) + small buffer, then remove display
+        setTimeout(() => { this.panel.style.display = 'none'; }, 450);
     }
 
     clearChat() {
